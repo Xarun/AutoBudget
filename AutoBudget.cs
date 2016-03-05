@@ -1,7 +1,10 @@
 ﻿using ColossalFramework;
+using ColossalFramework.UI;
 using ICities;
 using System;
 using System.Diagnostics;
+using System.IO;
+using System.Xml.Serialization;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
 
@@ -9,14 +12,91 @@ namespace AutoBudget
 {
   public class BudgetMod : IUserMod
   {
+    private UISlider budgetBufferSlider;
+    private UISlider updateFrequencySlider;
     #region Implementation of IUserMod
 
     public string Name { get { return "AutoBudget V2"; } }
     public string Description { get { return "Automatically sets budgets to the lowest possible value to maintain a 'green' status for electricity and water/sewage."; } }
 
     #endregion Implementation of IUserMod
-  }
+    #region Options menu
+    public void OnSettingsUI(UIHelperBase helper)
+    {
+      UIHelperBase group = helper.AddGroup("AutoBudget Settings");
+      budgetBufferSlider = group.AddSlider("Budget buffer", 0, 50, 1, AutoBudgetSettings.instance.budgetBuffer, OnBufferChange) as UISlider;
+      updateFrequencySlider = group.AddSlider("Update frequency (ms)", 100, 5000, 100, AutoBudgetSettings.instance.updateFrequency, OnFrequencyChange) as UISlider;
 
+      budgetBufferSlider.tooltip = AutoBudgetSettings.instance.budgetBuffer.ToString();
+      updateFrequencySlider.tooltip = AutoBudgetSettings.instance.updateFrequency.ToString();
+    }
+
+    private void OnFrequencyChange(float val)
+    {
+      AutoBudgetSettings.instance.updateFrequency = Mathf.RoundToInt(val);
+      AutoBudgetSettings.instance.SaveSettings();
+      updateFrequencySlider.tooltip = AutoBudgetSettings.instance.updateFrequency.ToString();
+    }
+
+    private void OnBufferChange(float val)
+    {
+      AutoBudgetSettings.instance.budgetBuffer = Mathf.RoundToInt(val);
+      AutoBudgetSettings.instance.SaveSettings();
+      budgetBufferSlider.tooltip = AutoBudgetSettings.instance.budgetBuffer.ToString();
+    }
+    #endregion
+  }
+  [Serializable]
+  public class AutoBudgetSettings
+  {
+    private static AutoBudgetSettings _instance;
+    public int budgetBuffer = 5;
+    private static string settingsPath = Application.dataPath + "/../AutoBudgetSettings.xml";
+    public int updateFrequency = 1000;
+
+    public static AutoBudgetSettings instance
+    {
+      get
+      {
+        if (_instance == null)
+        {
+          LoadSettings();
+        }
+        return _instance;
+      }
+    }
+
+    private static void LoadSettings()
+    {
+      var serializer = new XmlSerializer(typeof(AutoBudgetSettings));
+      if (!File.Exists(settingsPath))
+      {
+        _instance = new AutoBudgetSettings();
+        return;
+      }
+      using (var stream = new FileStream(settingsPath, FileMode.Open))
+      {
+        var oldSettings = serializer.Deserialize(stream) as AutoBudgetSettings;
+        if (oldSettings == null)
+        {
+          _instance = new AutoBudgetSettings();
+          return;
+        }
+        else
+        {
+          _instance = oldSettings;
+        }
+      }
+    }
+    public void SaveSettings()
+    {
+      var serializer = new XmlSerializer(typeof(AutoBudgetSettings));
+      using (var stream = new FileStream(settingsPath, FileMode.Create))
+      {
+        serializer.Serialize(stream, this);
+      }
+    }
+  }
   public class AutoBudget : ThreadingExtensionBase
   {
     public static int GetProductionRate(int productionRate, int budget)
@@ -83,7 +163,7 @@ namespace AutoBudget
                 if (ai is WindTurbineAI)
                 {
                   // Get the wind for the specific area.
-                  var turbineProduction = Mathf.RoundToInt(PlayerBuildingAI.GetProductionRate(data.m_productionRate, 100) * WeatherManager.instance.SampleWindSpeed(data.m_position, true));
+                  var turbineProduction = Mathf.RoundToInt(PlayerBuildingAI.GetProductionRate(data.m_productionRate, 100) * WeatherManager.instance.SampleWindSpeed(data.m_position, false));
                   return turbineProduction * max / 100;
                 }
                 if (ai is DamPowerHouseAI)
@@ -191,26 +271,13 @@ namespace AutoBudget
 
         // Add 2% to the required amount so we don't end up with crazy stuff happening
         // When there are big "booms" in player buildings.
-        eco.SetBudget(service, subService, Clamp(budget + 2, 10, 150), false);
-        eco.SetBudget(service, subService, Clamp(budget + 2, 10, 150), true);
+        eco.SetBudget(service, subService, Mathf.Clamp(budget + AutoBudgetSettings.instance.budgetBuffer, 50, 150), false);
+        eco.SetBudget(service, subService, Mathf.Clamp(budget + AutoBudgetSettings.instance.budgetBuffer, 50, 150), true);
       }
       catch (Exception ex)
       {
         Debug.LogException(ex);
       }
-    }
-
-    private int Clamp(int val, int min, int max)
-    {
-      if (val < min)
-      {
-        val = min;
-      }
-      if (val > max)
-      {
-        val = max;
-      }
-      return val;
     }
 
     private float GetPercentage(int capacity, int consumption, int consumptionMin = 45, int consumptionMax = 55)
@@ -238,7 +305,7 @@ namespace AutoBudget
         return;
       }
 
-      if (_throttle.ElapsedMilliseconds < 1000)
+      if (_throttle.Elapsed.TotalMilliseconds < AutoBudgetSettings.instance.updateFrequency)
       {
         return;
       }
