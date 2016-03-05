@@ -192,7 +192,7 @@ namespace AutoBudget
         // Add 2% to the required amount so we don't end up with crazy stuff happening
         // When there are big "booms" in player buildings.
         eco.SetBudget(service, subService, Clamp(budget + 2, 10, 150), false);
-        //eco.SetBudget(service, subService, Clamp(budget + 2, 10, 150), true);
+        eco.SetBudget(service, subService, Clamp(budget + 2, 10, 150), true);
       }
       catch (Exception ex)
       {
