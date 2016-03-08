@@ -2,6 +2,7 @@
 using ColossalFramework.UI;
 using ICities;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Xml.Serialization;
@@ -12,8 +13,6 @@ namespace AutoBudget
 {
   public class BudgetMod : IUserMod
   {
-    private UISlider budgetBufferSlider;
-    private UISlider updateFrequencySlider;
     #region Implementation of IUserMod
 
     public string Name { get { return "AutoBudget V2"; } }
@@ -21,14 +20,49 @@ namespace AutoBudget
 
     #endregion Implementation of IUserMod
     #region Options menu
+    private UISlider updateFrequencySlider;
     public void OnSettingsUI(UIHelperBase helper)
     {
       UIHelperBase group = helper.AddGroup("AutoBudget Settings");
-      budgetBufferSlider = group.AddSlider("Budget buffer", 0, 50, 1, AutoBudgetSettings.instance.budgetBuffer, OnBufferChange) as UISlider;
-      updateFrequencySlider = group.AddSlider("Update frequency (ms)", 100, 5000, 100, AutoBudgetSettings.instance.updateFrequency, OnFrequencyChange) as UISlider;
 
-      budgetBufferSlider.tooltip = AutoBudgetSettings.instance.budgetBuffer.ToString();
+      AddSlider(group, ItemClass.Service.Electricity);
+      AddSlider(group, ItemClass.Service.Water);
+      AddSlider(group, ItemClass.Service.Garbage);
+
+      updateFrequencySlider = group.AddSlider("Update frequency (ms)", 0, 5000, 100, AutoBudgetSettings.instance.updateFrequency, OnFrequencyChange) as UISlider;
+      group.AddCheckbox("Manage Garbage", AutoBudgetSettings.instance.manageGarbage, onGarbageCheckboxChange);
+      group.AddCheckbox("Debug", AutoBudgetSettings.instance.debug, onDebugCheckboxChange);
+
       updateFrequencySlider.tooltip = AutoBudgetSettings.instance.updateFrequency.ToString();
+    }
+
+    private void AddSlider(UIHelperBase group, ItemClass.Service service)
+    {
+      var Slider = group.AddSlider("Budget buffer(" + service.ToString() + ")", 0, 50, 1, AutoBudgetSettings.instance.buffers[(int)service], EmptyCallback) as UISlider;
+      var serviceNumber = (int)service;
+      Slider.tooltip = Slider.value.ToString();
+      Slider.eventValueChanged += delegate (UIComponent slider, float val)
+      {
+        slider.tooltip = val.ToString();
+        AutoBudgetSettings.instance.buffers[serviceNumber] = (int)val;
+        AutoBudgetSettings.instance.SaveSettings();
+      };
+    }
+
+    private void EmptyCallback(float val)
+    {
+    }
+
+    private void onDebugCheckboxChange(bool isChecked)
+    {
+      AutoBudgetSettings.instance.debug = isChecked;
+      AutoBudgetSettings.instance.SaveSettings();
+    }
+
+    private void onGarbageCheckboxChange(bool isChecked)
+    {
+      AutoBudgetSettings.instance.manageGarbage = isChecked;
+      AutoBudgetSettings.instance.SaveSettings();
     }
 
     private void OnFrequencyChange(float val)
@@ -37,22 +71,18 @@ namespace AutoBudget
       AutoBudgetSettings.instance.SaveSettings();
       updateFrequencySlider.tooltip = AutoBudgetSettings.instance.updateFrequency.ToString();
     }
-
-    private void OnBufferChange(float val)
-    {
-      AutoBudgetSettings.instance.budgetBuffer = Mathf.RoundToInt(val);
-      AutoBudgetSettings.instance.SaveSettings();
-      budgetBufferSlider.tooltip = AutoBudgetSettings.instance.budgetBuffer.ToString();
-    }
     #endregion
   }
+  #region settings
   [Serializable]
   public class AutoBudgetSettings
   {
     private static AutoBudgetSettings _instance;
-    public int budgetBuffer = 5;
     private static string settingsPath = Application.dataPath + "/../AutoBudgetSettings.xml";
     public int updateFrequency = 1000;
+    public bool manageGarbage = false;
+    public bool debug = false;
+    public int[] buffers = new int[21];
 
     public static AutoBudgetSettings instance
     {
@@ -97,6 +127,7 @@ namespace AutoBudget
       }
     }
   }
+  #endregion
   public class AutoBudget : ThreadingExtensionBase
   {
     public static int GetProductionRate(int productionRate, int budget)
@@ -150,6 +181,7 @@ namespace AutoBudget
       try
       {
         int capacity = 0;
+        int incineratorElectricityCapacity = 0;
         int consumption = 0;
         switch (service)
         {
@@ -157,14 +189,20 @@ namespace AutoBudget
             capacity = GetTotalCapacity(ItemClass.Service.Electricity,
               (ref Building data, PowerPlantAI ai) =>
               {
+                //return ai.GetElectricityRate(0, ref data);
                 int min;
                 int max;
                 ai.GetElectricityProduction(out min, out max);
                 if (ai is WindTurbineAI)
                 {
                   // Get the wind for the specific area.
-                  var turbineProduction = Mathf.RoundToInt(PlayerBuildingAI.GetProductionRate(data.m_productionRate, 100) * WeatherManager.instance.SampleWindSpeed(data.m_position, false));
+                  var turbineProduction = Mathf.RoundToInt(PlayerBuildingAI.GetProductionRate(data.m_productionRate, 100) * Singleton<WeatherManager>.instance.SampleWindSpeed(data.m_position, false));
                   return turbineProduction * max / 100;
+                }
+                if (ai is SolarPowerPlantAI)
+                {
+                  var solarPowerProduction = Mathf.RoundToInt(PlayerBuildingAI.GetProductionRate(data.m_productionRate, 100) * Singleton<WeatherManager>.instance.SampleSunIntensity(data.m_position, false));
+                  return solarPowerProduction * max / 100;
                 }
                 if (ai is DamPowerHouseAI)
                 {
@@ -192,16 +230,13 @@ namespace AutoBudget
                 return a * max / 100;
               }) * 16;
 
-            // Now check for incinerators, as they also add to our max capacity!!!
-            capacity += GetTotalCapacity(ItemClass.Service.Garbage,
+            // Now check for incinerators, as they also add to our max capacity, but seperatly since we arent adjusting their output wit the electricity slider!!!
+            incineratorElectricityCapacity = GetTotalCapacity(ItemClass.Service.Garbage,
               (ref Building data, LandfillSiteAI ai) =>
               {
                 if (ai.m_electricityProduction != 0)
                 {
-                  var ret =
-                    (Mathf.Min(PlayerBuildingAI.GetProductionRate(data.m_productionRate, 100),
-                      (data.m_customBuffer1 * 1000 + data.m_garbageBuffer) / (ai.m_garbageCapacity / 200)) * ai.m_electricityProduction + 99) / 100;
-                  return ret;
+                  return ai.GetElectricityRate(data.Info.m_instanceID.Building, ref data);
                 }
                 return 0;
               }) * 16;
@@ -249,8 +284,15 @@ namespace AutoBudget
             break;
 
           case ItemClass.Service.Garbage:
-            capacity = (int)district.m_productionData.m_tempIncinerationCapacity * 16;
             consumption = district.GetGarbageAccumulation();
+            capacity = GetTotalCapacity(ItemClass.Service.Garbage, (ref Building data, LandfillSiteAI ai) =>
+                 {
+                   if (ai.m_electricityProduction != 0)
+                   {
+                     return (PlayerBuildingAI.GetProductionRate(data.m_productionRate, 100) * ai.m_garbageConsumption + 99) / 100;
+                   }
+                   return 0;
+                 }) * 16;
             break;
         }
 
@@ -258,21 +300,25 @@ namespace AutoBudget
           return;
 
         int budget;
-        for (budget = 1; budget < 150; budget++)
+        for (budget = 50; budget < 150; budget++)
         {
-          if (GetProductionRate(capacity, budget) >= consumption)
+          if (GetProductionRate(capacity, budget) + incineratorElectricityCapacity >= consumption)
             break;
         }
 
         // How much of our capacity do we need to meet our demands?
         // This is odd for water specifically.
-        var neededUsage = (int)Math.Ceiling(((float)consumption / capacity) * 100);
-        DebugMessage("Service: " + service + ", Capacity: " + capacity + ", Consumption: " + consumption + ", Budget: " + budget + ", Needed: " + neededUsage);
+        if (AutoBudgetSettings.instance.debug)
+        {
+          consumption += incineratorElectricityCapacity;
+          var neededUsage = Mathf.CeilToInt(((float)consumption / capacity) * 100);
+          DebugMessage("Service: " + service + ", Capacity: " + capacity + ", Consumption: " + consumption + ", Budget: " + budget + ". Buffer: " + AutoBudgetSettings.instance.buffers[(int)service] + ", Needed: " + neededUsage);
+        }
 
         // Add 2% to the required amount so we don't end up with crazy stuff happening
         // When there are big "booms" in player buildings.
-        eco.SetBudget(service, subService, Mathf.Clamp(budget + AutoBudgetSettings.instance.budgetBuffer, 50, 150), false);
-        eco.SetBudget(service, subService, Mathf.Clamp(budget + AutoBudgetSettings.instance.budgetBuffer, 50, 150), true);
+        eco.SetBudget(service, subService, Mathf.Clamp(budget + AutoBudgetSettings.instance.buffers[(int)service], 50, 150), SimulationManager.instance.m_isNightTime);
+
       }
       catch (Exception ex)
       {
@@ -305,18 +351,25 @@ namespace AutoBudget
         return;
       }
 
-      if (_throttle.Elapsed.TotalMilliseconds < AutoBudgetSettings.instance.updateFrequency)
+      if (AutoBudgetSettings.instance.updateFrequency != 0)
       {
-        return;
+        if (_throttle.Elapsed.TotalMilliseconds <= AutoBudgetSettings.instance.updateFrequency)
+        {
+          return;
+        }
+        _throttle.Reset();
+        _throttle.Start();
       }
 
       var eco = Singleton<EconomyManager>.instance;
 
       UpdateBudget(eco, ref Singleton<DistrictManager>.instance.m_districts.m_buffer[0], ItemClass.Service.Electricity);
       UpdateBudget(eco, ref Singleton<DistrictManager>.instance.m_districts.m_buffer[0], ItemClass.Service.Water);
+      if (AutoBudgetSettings.instance.manageGarbage)
+      {
+        UpdateBudget(eco, ref Singleton<DistrictManager>.instance.m_districts.m_buffer[0], ItemClass.Service.Garbage);
+      }
 
-      _throttle.Reset();
-      _throttle.Start();
     }
 
     #endregion Overrides of ThreadingExtensionBase
